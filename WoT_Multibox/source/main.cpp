@@ -42,30 +42,45 @@ NTSTATUS AuditProcessHandles(
 	NTSTATUS last_status = STATUS_SUCCESS;
 
 	// Capture all handles for the process
-	ULONG size = 0x20;
 	PPROCESS_HANDLE_SNAPSHOT_INFORMATION handle_snapshot_information = nullptr;
+	ULONG size_required = 0x10;
+	
+	// Determine the size needed for the handle information
+	// by calling the function with an insufficiently-sized buffer
 	do
 	{
-		// Allocate buffer for our handle snapshot information
-		PVOID buffer = realloc(handle_snapshot_information, size *= 2);
-
-		// Make sure it is non-null
-		if (!buffer)
+		size_required *= 2;
+		
+		// IntelliSense is wrong here, this doesn't leak memory
+		handle_snapshot_information = reinterpret_cast<PPROCESS_HANDLE_SNAPSHOT_INFORMATION>(
+			realloc(handle_snapshot_information, size_required)
+		);
+		
+		// Failed to allocate? Try again...
+		if (!handle_snapshot_information)
 			continue;
 
-		// Assign to the higher-level pointer
-		handle_snapshot_information = reinterpret_cast<PPROCESS_HANDLE_SNAPSHOT_INFORMATION>(buffer);
-
-		// Try to query info to update status code
 		last_status = NtQueryInformationProcess(
 			ProcessHandle,
 			ProcessHandleInformation,
 			handle_snapshot_information,
-			size,
+			size_required,
 			nullptr
 		);
 
 	} while (last_status == STATUS_INFO_LENGTH_MISMATCH);
+
+	// The function should not return any error code other than
+	// complaining about our buffer being too small
+	if (!NT_SUCCESS(last_status))
+	{
+		goto cleanup;
+	}
+
+	// Try to allocate memory for the snapshot buffer
+	handle_snapshot_information = reinterpret_cast<PPROCESS_HANDLE_SNAPSHOT_INFORMATION>(
+		malloc(size_required)
+	);
 
 	if (!handle_snapshot_information)
 	{
@@ -73,7 +88,16 @@ NTSTATUS AuditProcessHandles(
 		goto cleanup;
 	}
 
-	// Skip this process if we failed to allocate stuff
+	// Call the function again, this time with our buffer
+	last_status = NtQueryInformationProcess(
+		ProcessHandle,
+		ProcessHandleInformation,
+		handle_snapshot_information,
+		size_required,
+		nullptr
+	);
+
+	// Skip this iteration if the second call failed
 	if (!NT_SUCCESS(last_status))
 	{
 		goto cleanup;
@@ -95,32 +119,60 @@ NTSTATUS AuditProcessHandles(
 			DUPLICATE_SAME_ACCESS
 		);
 
+		// Make sure we duplicated the handle properly
 		if (!NT_SUCCESS(last_status))
 			continue;
 
-		// Figure out what size is needed for the name
-		ULONG return_length = sizeof(UNICODE_STRING);
+		ULONG object_name_size = 0;
 		PUNICODE_STRING object_name = nullptr;
-		do
+
+		// Figure out what size is needed for the name
+		last_status = NtQueryObject(
+			duplicated_handle,
+			ObjectNameInformation,
+			object_name,
+			0,
+			&object_name_size
+		);
+
+		// The function should not return any error code other than
+		// complaining about our buffer being too small
+		if (last_status != STATUS_INFO_LENGTH_MISMATCH)
 		{
-			object_name = reinterpret_cast<PUNICODE_STRING>(realloc(object_name, return_length *= 2));
+			CloseHandle(duplicated_handle);
+			continue;
+		}
 
-			last_status = NtQueryObject(
-				duplicated_handle,
-				ObjectNameInformation,
-				object_name,
-				return_length,
-				&return_length
-			);
+		// Try to allocate memory for the string buffer
+		object_name = reinterpret_cast<PUNICODE_STRING>(
+			malloc(size_required)
+		);
 
-		} while (last_status == STATUS_INFO_LENGTH_MISMATCH);
+		// Make sure the memory got allocated
+		if (!object_name)
+		{
+			CloseHandle(duplicated_handle);
+			continue;
+		}
+
+		// Try to query again, this time with the correct size
+		last_status = NtQueryObject(
+			duplicated_handle,
+			ObjectNameInformation,
+			object_name,
+			object_name_size,
+			nullptr
+		);
 
 		// Close the duplicated handle, no need to keep it open anymore
 		CloseHandle(duplicated_handle);
 
 		// Skip any unnamed handles
-		if (!NT_SUCCESS(last_status) || !object_name || !object_name->Buffer)
+		if (!NT_SUCCESS(last_status) || !object_name->Buffer)
 		{
+			if (object_name)
+				free(object_name);
+
 			continue;
 		}
 
@@ -160,8 +212,7 @@ NTSTATUS AuditProcessHandles(
 			CloseHandle(mtx_handle);
 		}
 
-		if (object_name)
-			free(object_name);
+		free(object_name);
 	}
 
 	last_status = STATUS_SUCCESS;
