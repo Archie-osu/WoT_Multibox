@@ -98,9 +98,9 @@ NTSTATUS AuditProcessHandles(
 		if (!NT_SUCCESS(last_status))
 			continue;
 
+		// Figure out what size is needed for the name
 		ULONG return_length = sizeof(UNICODE_STRING);
 		PUNICODE_STRING object_name = nullptr;
-
 		do
 		{
 			object_name = reinterpret_cast<PUNICODE_STRING>(realloc(object_name, return_length *= 2));
@@ -118,7 +118,8 @@ NTSTATUS AuditProcessHandles(
 		// Close the duplicated handle, no need to keep it open anymore
 		CloseHandle(duplicated_handle);
 
-		if (!NT_SUCCESS(last_status) || !object_name->Buffer)
+		// Skip any unnamed handles
+		if (!NT_SUCCESS(last_status) || !object_name || !object_name->Buffer)
 		{
 			continue;
 		}
